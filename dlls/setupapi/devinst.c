@@ -96,6 +96,7 @@ static const WCHAR Capabilities[] = {'C','a','p','a','b','i','l','i','t','i','e'
 static const WCHAR UINumber[] = {'U','I','N','u','m','b','e','r',0};
 static const WCHAR UpperFilters[] = {'U','p','p','e','r','F','i','l','t','e','r','s',0};
 static const WCHAR LowerFilters[] = {'L','o','w','e','r','F','i','l','t','e','r','s',0};
+static const WCHAR ContainerId[] = {'C','o','n','t','a','i','n','e','r','I','d',0};
 static const WCHAR Phantom[] = {'P','h','a','n','t','o','m',0};
 static const WCHAR SymbolicLink[] = {'S','y','m','b','o','l','i','c','L','i','n','k',0};
 static const WCHAR Control[] = {'C','o','n','t','r','o','l',0};
@@ -654,6 +655,7 @@ static const struct PropertyMapEntry PropertyMap[] = {
     { REG_DWORD, "UINumber", UINumber },
     { REG_MULTI_SZ, "UpperFilters", UpperFilters },
     { REG_MULTI_SZ, "LowerFilters", LowerFilters },
+    [SPDRP_BASE_CONTAINERID] = { REG_SZ, "ContainerId", ContainerId },
 };
 
 static BOOL SETUPDI_SetDeviceRegistryPropertyW(struct device *device,
@@ -3046,6 +3048,55 @@ BOOL WINAPI SetupDiDestroyDeviceInfoList(HDEVINFO devinfo)
 
     SetLastError(ERROR_SUCCESS);
     return TRUE;
+}
+
+/***********************************************************************
+ *              SetupDiGetDeviceInterfacePropertyW (SETUPAPI.@)
+ */
+BOOL WINAPI SetupDiGetDeviceInterfacePropertyW(HDEVINFO devinfo, SP_DEVICE_INTERFACE_DATA *iface_data,
+                const DEVPROPKEY *prop_key, DEVPROPTYPE *prop_type, BYTE *prop_buff,
+                DWORD prop_buff_size, DWORD *required_size, DWORD flags) {
+
+    // TODO: should probably use DEVPKEY_Device_InstanceId
+    static const DEVPROPKEY device_instanceid_key = {
+        {0x78c34fc8, 0x104a, 0x4aca, {0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0x57}}, 256
+    };
+
+    TRACE("%p, %p, (%s, %04x), %p, %p, %d, %p, %#x\n", devinfo, iface_data, wine_dbgstr_guid(&prop_key->fmtid), prop_key->pid, prop_type, prop_buff, prop_buff_size,
+          required_size, flags);
+
+    // Special case for InstanceID
+    if (IsEqualDevPropKey(*prop_key, device_instanceid_key)) {
+        struct device *device;
+        struct device_iface *iface;
+
+        if (!(iface = get_device_iface(devinfo, iface_data)))
+            return FALSE;
+
+        if (!(device = iface->device))
+            return FALSE;
+
+        TRACE("instance ID: %s\n", debugstr_w(device->instanceId));
+        if (prop_buff_size < lstrlenW(device->instanceId) + 1)
+        {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            if (required_size)
+                *required_size = lstrlenW(device->instanceId) + 1;
+            return FALSE;
+        }
+
+        lstrcpyW((WCHAR *) prop_buff, device->instanceId);
+        if (required_size)
+            *required_size = lstrlenW(device->instanceId) + 1;
+        *prop_type = DEVPROP_TYPE_STRING;
+
+        return TRUE;
+    } else {
+        // TODO: maybe fall back as SetupDiGetDevicePropertyW?
+        FIXME("stub\n");
+    }
+
+    return FALSE;
 }
 
 /***********************************************************************

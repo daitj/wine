@@ -189,6 +189,41 @@ static HRESULT MMDevice_GetPropValue(const GUID *devguid, DWORD flow, REFPROPERT
             break;
     }
     RegCloseKey(regkey);
+
+    /* Special case ContainerID as CLSID */
+    if(pv->vt == VT_BLOB && pv->blob.pBlobData && pv->blob.cbSize == 24 && pv->blob.pBlobData[0] == VT_CLSID && IsEqualPropertyKey(*key, DEVPKEY_Device_ContainerId)) {
+        GUID *guid = CoTaskMemAlloc(sizeof(GUID));
+        if (!guid) {
+            PropVariantClear(pv);
+            hr = E_OUTOFMEMORY;
+        } else {
+            memcpy(guid, pv->blob.pBlobData + 8, sizeof(GUID));
+            CoTaskMemFree(pv->blob.pBlobData);
+            pv->vt = VT_CLSID;
+            pv->puuid = guid;
+        }
+    }
+
+    return hr;
+}
+
+static HRESULT MMDevice_DeletePropValue(const GUID *devguid, DWORD flow, REFPROPERTYKEY key)
+{
+    WCHAR buffer[80];
+    const GUID *id = &key->fmtid;
+    HRESULT hr;
+    HKEY regkey;
+    LONG ret;
+
+    hr = MMDevPropStore_OpenPropKey(devguid, flow, &regkey);
+    if (FAILED(hr))
+        return hr;
+    wsprintfW( buffer, propkey_formatW, id->Data1, id->Data2, id->Data3,
+               id->Data4[0], id->Data4[1], id->Data4[2], id->Data4[3],
+               id->Data4[4], id->Data4[5], id->Data4[6], id->Data4[7], key->pid );
+    ret = RegDeleteValueW(regkey, buffer);
+    RegCloseKey(regkey);
+    TRACE("Deleting %s returned %lu\n", debugstr_w(buffer), ret);
     return hr;
 }
 
@@ -225,6 +260,18 @@ static HRESULT MMDevice_SetPropValue(const GUID *devguid, DWORD flow, REFPROPERT
             ret = RegSetValueExW(regkey, buffer, 0, REG_SZ, (const BYTE*)pv->pwszVal, sizeof(WCHAR)*(1+lstrlenW(pv->pwszVal)));
             break;
         }
+        case VT_CLSID:
+        {
+            if (IsEqualPropertyKey(*key, DEVPKEY_Device_ContainerId)) {
+                BYTE value[24] = { VT_CLSID, 0, 0, 0, 1, 0, 0, 0 };
+                memcpy(value + 8, pv->puuid, sizeof(GUID));
+
+                ret = RegSetValueExW(regkey, buffer, 0, REG_BINARY, (const BYTE*)value, 24);
+                break;
+            }
+            /* If it's not containerId, fall through the default unsupported case as we can't
+               ensure it will be decoded as CLSID. */
+        }
         default:
             ret = 0;
             FIXME("Unhandled type %u\n", pv->vt);
@@ -253,6 +300,30 @@ static HRESULT set_driver_prop_value(GUID *id, const EDataFlow flow, const PROPE
     }
 
     return hr;
+}
+
+struct product_name_overrides
+{
+    const WCHAR *id;
+    const WCHAR *product;
+};
+
+static const struct product_name_overrides product_name_overrides[] =
+{
+    /* Sony controllers */
+    { .id = L"VID_054C&PID_0CE6", .product = L"Wireless Controller" },
+};
+
+static const WCHAR *find_product_name_override(const WCHAR *device_id)
+{
+    const WCHAR *match_id = wcschr( device_id, '\\' ) + 1;
+    DWORD i;
+
+    for (i = 0; i < ARRAY_SIZE(product_name_overrides); ++i)
+        if (!wcsnicmp( product_name_overrides[i].id, match_id, 17 ))
+            return product_name_overrides[i].product;
+
+    return NULL;
 }
 
 /* Creates or updates the state of a device
@@ -321,14 +392,36 @@ static MMDevice *MMDevice_Create(WCHAR *name, GUID *id, EDataFlow flow, DWORD st
 
             pv.vt = VT_LPWSTR;
             pv.pwszVal = name;
+
+            if (SUCCEEDED(set_driver_prop_value(id, flow, &devicepath_key))) {
+                PROPVARIANT pv2;
+
+                PropVariantInit(&pv2);
+
+                if (SUCCEEDED(MMDevice_GetPropValue(id, flow, &devicepath_key, &pv2)) && pv2.vt == VT_LPWSTR) {
+                    const WCHAR *override;
+                    if ((override = find_product_name_override(pv2.pwszVal)) != NULL)
+                        pv.pwszVal = (WCHAR*) override;
+                }
+
+                PropVariantClear(&pv2);
+            }
+
             MMDevice_SetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_FriendlyName, &pv);
             MMDevice_SetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_DeviceInterface_FriendlyName, &pv);
             MMDevice_SetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_DeviceDesc, &pv);
 
+            /* The mechanism we use to attribute Container IDs is not very robust and could end up making
+               an active device share a ContainerID with inactive devices, and some games enumerate even
+               inactive devices, stopping at the first matching one.
+               To avoid issues, invalidate the ContainerID of devices that are not present. */
+            if (state & DEVICE_STATE_ACTIVE)
+                set_driver_prop_value(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_ContainerId);
+            else if (state & DEVICE_STATE_NOTPRESENT)
+                MMDevice_DeletePropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_ContainerId);
+
             pv.pwszVal = guidstr;
             MMDevice_SetPropValue(id, flow, &deviceinterface_key, &pv);
-
-            set_driver_prop_value(id, flow, &devicepath_key);
 
             if (FAILED(set_driver_prop_value(id, flow, &PKEY_AudioEndpoint_FormFactor)))
             {
